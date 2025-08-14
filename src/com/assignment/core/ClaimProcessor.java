@@ -7,11 +7,15 @@ import com.assignment.entity.Claim;
 import com.assignment.entity.ClaimStatus;
 import com.assignment.entity.ClaimType;
 import com.assignment.entity.Priority;
+import com.assignment.main.Config;
 import com.assignment.report.SummaryReport;
+import com.assignment.util.AuditLogger;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -81,7 +85,7 @@ public class ClaimProcessor {
     }
 
     private void ingestClaims() {
-        try (BufferedReader br = Files.newBufferedReader(Paths.get("claims.csv"))) {
+        try (BufferedReader br = Files.newBufferedReader(Paths.get("/Users/DIPESH.M/Documents/Assignment8/src/com/assignment/main/Claims Data - Sheet2.csv"),java.nio.charset.StandardCharsets.UTF_8)) {
             String line = br.readLine(); // Skip header
             while ((line = br.readLine()) != null) {
                 waitForBacklogSpace();
@@ -98,6 +102,8 @@ public class ClaimProcessor {
             }
         } catch (IOException e) {
             e.printStackTrace();
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
         } finally {
             ingesting = false;
         }
@@ -117,7 +123,9 @@ public class ClaimProcessor {
             String policyNumber = parts[1].trim();
             int amount = Integer.parseInt(parts[2].trim());
             ClaimType type = ClaimType.valueOf(parts[3].trim().toUpperCase());
-            LocalDateTime timestamp = LocalDateTime.parse(parts[4].trim());
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+            LocalDateTime timestamp = LocalDateTime.parse(parts[4].trim(), formatter);
+
             Priority priority = Priority.valueOf(parts[5].trim().toUpperCase());
 
             Claim claim = new Claim(claimId, policyNumber, amount, type, timestamp, priority);

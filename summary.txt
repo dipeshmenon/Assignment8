@@ -1,0 +1,7 @@
+Total unique claims processed: 120
+Number Approved: 105
+Number Escalated: 0
+Number Rejected: 15
+Number suspicious claims detected: 0
+Total amount paid (Approved): 0
+Average processing attempts per claim: 1.27

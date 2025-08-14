@@ -1,17 +1,28 @@
 package com.assignment.main;
 
-//TIP To <b>Run</b> code, press <shortcut actionId="Run"/> or
-// click the <icon src="AllIcons.Actions.Execute"/> icon in the gutter.
+import com.assignment.core.ClaimProcessor;
+import com.assignment.main.Config;
+import com.assignment.util.ShutdownHandler;
+
 public class Main {
     public static void main(String[] args) {
-        //TIP Press <shortcut actionId="ShowIntentionActions"/> with your caret at the highlighted text
-        // to see how IntelliJ IDEA suggests fixing it.
-        System.out.printf("Hello and welcome!");
+        try {
+            // Load config from file
+            Config.load("/Users/DIPESH.M/Documents/Assignment8/src/com/assignment/main/config.properties");
 
-        for (int i = 1; i <= 5; i++) {
-            //TIP Press <shortcut actionId="Debug"/> to start debugging your code. We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-            // for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.
-            System.out.println("i = " + i);
+            // Start claim processor
+            ClaimProcessor processor = new ClaimProcessor();
+            processor.start();
+
+            // Register graceful shutdown hook
+            ShutdownHandler.register(() -> {
+                System.out.println("Shutdown initiated...");
+                processor.shutdown();
+            });
+
+        } catch (Exception e) {
+            System.err.println("Error during startup: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 }
