@@ -7,85 +7,108 @@ import com.assignment.util.AuditLogger;
 
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Callable;
-import java.util.concurrent.FutureTask;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class ClaimWorker implements Runnable {
-    private final BlockingQueue<Claim> queue;
-    private final Map<String, Lock> policyLocks;
-    private final Set<String> processedClaims;
-    private final SummaryReport report;
+    private final ClaimProcessor processor;
 
-    public ClaimWorker(BlockingQueue<Claim> queue, Map<String, Lock> policyLocks, Set<String> processedClaims, SummaryReport report) {
-        this.queue = queue;
-        this.policyLocks = policyLocks;
-        this.processedClaims = processedClaims;
-        this.report = report;
+    public ClaimWorker(ClaimProcessor processor) {
+        this.processor = processor;
     }
 
     @Override
     public void run() {
-        while (true) {
+        while (processor.isIngesting() || !processor.getGlobalQueue().isEmpty()) {
             try {
-                Claim claim = queue.take();
-                if (processedClaims.contains(claim.claimId)) continue;
+                Claim claim = processor.takeClaim();
+                if (claim == null) continue;
 
-                Lock lock = policyLocks.computeIfAbsent(claim.policyNumber, k -> new ReentrantLock());
-                lock.lock();
+                ReentrantLock lock = processor.getPolicyLock(claim.policyNumber);
+                if (lock == null) {
+                    // Should not happen
+                    processor.enqueueClaim(claim);
+                    continue;
+                }
+
+                boolean acquired = lock.tryLock(1, TimeUnit.SECONDS);
+                if (!acquired) {
+                    // Could not get lock, re-queue claim
+                    processor.enqueueClaim(claim);
+                    continue;
+                }
+
                 try {
-                    processClaim(claim);
+                    // Confirm claim is first in policy queue
+                    Deque<Claim> queue = processor.getPolicyQueue(claim.policyNumber);
+                    if (queue == null || queue.peekFirst() != claim) {
+                        // Not first, requeue
+                        processor.enqueueClaim(claim);
+                        continue;
+                    }
+
+                    // Remove from per-policy queue head
+                    queue.pollFirst();
+
+                    // Idempotency check
+                    if (processor.getProcessedClaims().contains(claim.claimId)) {
+                        // Already processed
+                        AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                                ClaimStatus.RECEIVED, ClaimStatus.RECEIVED, claim.attempt);
+                        continue;
+                    }
+
+                    claim.attempt++;
+                    AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                            ClaimStatus.RECEIVED, ClaimStatus.PROCESSING, claim.attempt);
+
+                    ExternalCheckSimulator.Result checkResult = runExternalCheckWithTimeout(claim);
+
+                    if (checkResult == ExternalCheckSimulator.Result.SUCCESS) {
+                        processor.markProcessed(claim, ClaimStatus.APPROVED);
+                        AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                                ClaimStatus.PROCESSING, ClaimStatus.APPROVED, claim.attempt);
+                        if (claim.isSuspicious()) {
+                            processor.getThrottleMonitor().reportSuspicious(claim);
+                        }
+                    } else if (checkResult == ExternalCheckSimulator.Result.TRANSIENT_FAILURE) {
+                        if (claim.attempt <= Config.RETRY_LIMIT) {
+                            AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                                    ClaimStatus.PROCESSING, ClaimStatus.FAILED, claim.attempt);
+                            processor.enqueueClaim(claim); // retry preserving order
+                        } else {
+                            processor.markProcessed(claim, ClaimStatus.REJECTED);
+                            AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                                    ClaimStatus.PROCESSING, ClaimStatus.REJECTED, claim.attempt);
+                        }
+                    } else { // PERMANENT_FAILURE
+                        processor.markProcessed(claim, ClaimStatus.REJECTED);
+                        AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                                ClaimStatus.PROCESSING, ClaimStatus.REJECTED, claim.attempt);
+                    }
                 } finally {
                     lock.unlock();
                 }
-
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 break;
+            } catch (Exception e) {
+                e.printStackTrace();
             }
         }
     }
 
-    private void processClaim(Claim claim) {
-        claim.attempt++;
-        ClaimStatus oldStatus = ClaimStatus.RECEIVED;
-        ClaimStatus newStatus = ClaimStatus.PROCESSING;
-        AuditLogger.log(claim.claimId, Thread.currentThread().getName(), oldStatus, newStatus, claim.attempt);
-
-        Result result = null;
-
-        Callable<Result> task = () -> ExternalCheckSimulator.check(claim);
-        FutureTask<Result> future = new FutureTask<>(task);
-        new Thread(future).start();
-
+    private ExternalCheckSimulator.Result runExternalCheckWithTimeout(Claim claim) throws Exception {
+        ExecutorService exec = Executors.newSingleThreadExecutor();
         try {
-            result = future.get(Config.TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            var future = exec.submit(() -> ExternalCheckSimulator.check(claim));
+            return future.get(Config.TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            result = Result.TRANSIENT_FAILURE;
-            future.cancel(true);
-        }
-
-        switch (result) {
-            case SUCCESS -> {
-                AuditLogger.log(claim.claimId, Thread.currentThread().getName(), newStatus, ClaimStatus.APPROVED, claim.attempt);
-                processedClaims.add(claim.claimId);
-                report.add(claim, ClaimStatus.APPROVED, claim.attempt);
-            }
-            case PERMANENT_FAILURE -> {
-                AuditLogger.log(claim.claimId, Thread.currentThread().getName(), newStatus, ClaimStatus.REJECTED, claim.attempt);
-                processedClaims.add(claim.claimId);
-                report.add(claim, ClaimStatus.REJECTED, claim.attempt);
-            }
-            case TRANSIENT_FAILURE -> {
-                if (claim.attempt < Config.RETRY_LIMIT) {
-                    queue.offer(claim);
-                } else {
-                    AuditLogger.log(claim.claimId, Thread.currentThread().getName(), newStatus, ClaimStatus.ESCALATED, claim.attempt);
-                    processedClaims.add(claim.claimId);
-                    report.add(claim, ClaimStatus.ESCALATED, claim.attempt);
-                }
-            }
+            // Timeout or other
+            return ExternalCheckSimulator.Result.TRANSIENT_FAILURE;
+        } finally {
+            exec.shutdownNow();
         }
     }
 }

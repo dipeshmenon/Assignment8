@@ -11,42 +11,77 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ThrottleMonitor implements Runnable {
-    private final Deque<Instant> suspiciousTimestamps = new LinkedList<>();
-    private final AtomicBoolean throttled = new AtomicBoolean(false);
-    private final BlockingQueue<Claim> queue;
+    private final ClaimProcessor processor;
+    public final Deque<Instant> suspiciousTimestamps = new LinkedList<>();
+    private volatile boolean running = true;
+    private volatile boolean paused = false;
 
-    public ThrottleMonitor(BlockingQueue<Claim> queue) {
-        this.queue = queue;
+    public ThrottleMonitor(ClaimProcessor processor) {
+        this.processor = processor;
     }
 
-    public boolean isThrottled() {
-        return throttled.get();
+    public synchronized void reportSuspicious(Claim claim) {
+        Instant now = Instant.now();
+        suspiciousTimestamps.addLast(now);
+
+        // Print suspicious claim immediately
+        System.out.printf("Suspicious claim detected: %s amount=%d type=%s%n",
+                claim.claimId, claim.amount, claim.type);
+
+        cleanupOld(now);
+
+        if (suspiciousTimestamps.size() > Config.SUSPICIOUS_THRESHOLD && !paused) {
+            paused = true;
+            new Thread(() -> {
+                try {
+                    System.out.println("Throttling intake for 2 seconds due to suspicious claims...");
+                    Thread.sleep(2000);
+                } catch (InterruptedException ignored) {}
+                synchronized (this) {
+                    paused = false;
+                    suspiciousTimestamps.clear();
+                    this.notifyAll();
+                }
+            }).start();
+        }
+    }
+
+    private void cleanupOld(Instant now) {
+        Instant windowStart = now.minusSeconds(Config.SUSPICIOUS_WINDOW_SEC);
+        while (!suspiciousTimestamps.isEmpty() && suspiciousTimestamps.peekFirst().isBefore(windowStart)) {
+            suspiciousTimestamps.pollFirst();
+        }
+    }
+
+    public synchronized boolean isPaused() {
+        return paused;
     }
 
     @Override
     public void run() {
-        while (true) {
-            try {
-                for (Claim claim : queue) {
-                    if (claim.isSuspicious()) {
-                        suspiciousTimestamps.add(Instant.now());
-                        System.out.println("Suspicious claim: " + claim.claimId);
+        while (running) {
+            synchronized (this) {
+                if (paused) {
+                    try {
+                        this.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                     }
                 }
-
-                suspiciousTimestamps.removeIf(ts -> ts.isBefore(Instant.now().minusSeconds(Config.SUSPICIOUS_WINDOW_SEC)));
-
-                if (suspiciousTimestamps.size() > Config.SUSPICIOUS_THRESHOLD) {
-                    throttled.set(true);
-                    System.out.println("THROTTLING INTAKE...");
-                    Thread.sleep(2000); // Pause
-                    throttled.set(false);
-                }
-
-                Thread.sleep(1000); // Run every 1s
+            }
+            try {
+                Thread.sleep(100);
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 break;
             }
+        }
+    }
+
+    public void stop() {
+        running = false;
+        synchronized (this) {
+            this.notifyAll();
         }
     }
 }

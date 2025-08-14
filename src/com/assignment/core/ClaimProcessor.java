@@ -4,85 +4,197 @@ package com.assignment.core;
 
 
 import com.assignment.entity.Claim;
+import com.assignment.entity.ClaimStatus;
 import com.assignment.entity.ClaimType;
 import com.assignment.entity.Priority;
+import com.assignment.report.SummaryReport;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class ClaimProcessor {
-    private final BlockingQueue<Claim> backlog = new PriorityBlockingQueue<>(Config.BACKLOG_CAPACITY, Comparator
-            .comparing((Claim c) -> c.priority).reversed()
-            .thenComparing(c -> c.timestamp));
-    private final Map<String, Lock> policyLocks = new ConcurrentHashMap<>();
+    private final int workerCount = Config.WORKER_COUNT;
+    private final int backlogCapacity = Config.BACKLOG_CAPACITY;
+    private final int retryLimit = Config.RETRY_LIMIT;
+
+    private final BlockingQueue<Claim> globalQueue;
+    private final Map<String, Deque<Claim>> policyQueues = new ConcurrentHashMap<>();
+    private final Map<String, ReentrantLock> policyLocks = new ConcurrentHashMap<>();
     private final Set<String> processedClaims = ConcurrentHashMap.newKeySet();
-    private final ExecutorService workers = Executors.newFixedThreadPool(Config.WORKER_COUNT);
-    private final AtomicBoolean isShuttingDown = new AtomicBoolean(false);
-    private final SummaryReport report = new SummaryReport();
+    private final Map<String, List<String>> claimHistory = new ConcurrentHashMap<>();
+    private final Map<String, ClaimStatus> claimFinalStatus = new ConcurrentHashMap<>();
+    private final Map<String, Integer> claimAttempts = new ConcurrentHashMap<>();
+    private final ExecutorService workers;
     private final ThrottleMonitor throttleMonitor;
 
+    private volatile boolean ingesting = true;
+
+    private long startTime;
+
     public ClaimProcessor() {
-        throttleMonitor = new ThrottleMonitor(backlog);
+        // Priority queue with comparator to prioritize URGENT over NORMAL, then timestamp
+        this.globalQueue = new PriorityBlockingQueue<>(backlogCapacity, (c1, c2) -> {
+            if (c1.priority != c2.priority)
+                return c1.priority == Priority.URGENT ? -1 : 1;
+            return c1.timestamp.compareTo(c2.timestamp);
+        });
+        this.workers = Executors.newFixedThreadPool(workerCount);
+        this.throttleMonitor = new ThrottleMonitor(this);
     }
 
-    public void start() throws Exception {
-        loadClaims("claims.csv");
-
+    public void start() throws IOException {
+        startTime = System.nanoTime();
         // Start throttle monitor
         new Thread(throttleMonitor).start();
 
-        // Start worker threads
-        for (int i = 0; i < Config.WORKER_COUNT; i++) {
-            workers.submit(new ClaimWorker(backlog, policyLocks, processedClaims, report));
+        // Start ingestion thread
+        Thread ingestionThread = new Thread(this::ingestClaims);
+        ingestionThread.start();
+
+        // Start workers
+        for (int i = 0; i < workerCount; i++) {
+            workers.submit(new ClaimWorker(this));
+        }
+
+        try {
+            ingestionThread.join();
+            workers.shutdown();
+            workers.awaitTermination(1, TimeUnit.HOURS);
+            throttleMonitor.stop();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // Write summary report
+        new SummaryReport(this).writeReport();
+
+        long elapsed = System.nanoTime() - startTime;
+        System.out.printf("Processing complete in %.2f seconds.%n", elapsed / 1e9);
+    }
+
+    private void ingestClaims() {
+        try (BufferedReader br = Files.newBufferedReader(Paths.get("claims.csv"))) {
+            String line = br.readLine(); // Skip header
+            while ((line = br.readLine()) != null) {
+                waitForBacklogSpace();
+                Claim claim = parseClaim(line);
+                if (claim == null) continue;
+
+                if (!processedClaims.contains(claim.claimId)) {
+                    enqueueClaim(claim);
+                } else {
+                    // Duplicate, ignore but log attempt
+                    AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
+                            ClaimStatus.RECEIVED, ClaimStatus.RECEIVED, 0);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            ingesting = false;
         }
     }
 
-    private void loadClaims(String filename) throws Exception {
-        BufferedReader br = new BufferedReader(new FileReader(filename));
-        String line;
-        br.readLine(); // skip header
-        DateTimeFormatter dtf = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
+    private void waitForBacklogSpace() throws InterruptedException {
+        while (globalQueue.size() >= backlogCapacity || throttleMonitor.isPaused()) {
+            Thread.sleep(50);
+        }
+    }
 
-        while ((line = br.readLine()) != null) {
+    private Claim parseClaim(String line) {
+        try {
             String[] parts = line.split(",");
-            Claim claim = new Claim(
-                    parts[0],
-                    parts[1],
-                    Integer.parseInt(parts[2]),
-                    ClaimType.valueOf(parts[3].toUpperCase()),
-                    LocalDateTime.parse(parts[4], dtf),
-                    parts[5].equalsIgnoreCase("URGENT") ? Priority.URGENT : Priority.NORMAL
-            );
-            waitIfThrottled();
-            backlog.put(claim); // Blocks if full
+            if (parts.length != 6) return null;
+            String claimId = parts[0].trim();
+            String policyNumber = parts[1].trim();
+            int amount = Integer.parseInt(parts[2].trim());
+            ClaimType type = ClaimType.valueOf(parts[3].trim().toUpperCase());
+            LocalDateTime timestamp = LocalDateTime.parse(parts[4].trim());
+            Priority priority = Priority.valueOf(parts[5].trim().toUpperCase());
+
+            Claim claim = new Claim(claimId, policyNumber, amount, type, timestamp, priority);
+            return claim;
+        } catch (Exception e) {
+            System.err.println("Failed to parse line: " + line);
+            return null;
         }
-        br.close();
     }
 
-    private void waitIfThrottled() throws InterruptedException {
-        while (throttleMonitor.isThrottled()) {
-            Thread.sleep(200); // Wait during pause
+    public void enqueueClaim(Claim claim) {
+        // Add to per-policy queue
+        policyQueues.computeIfAbsent(claim.policyNumber, k -> new ConcurrentLinkedDeque<>()).addLast(claim);
+        // Add lock for policy if not present
+        policyLocks.computeIfAbsent(claim.policyNumber, k -> new ReentrantLock());
+
+        // Add to global queue
+        try {
+            globalQueue.put(claim);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
+    }
+
+    public Claim takeClaim() throws InterruptedException {
+        return globalQueue.take();
+    }
+
+    public void markProcessed(Claim claim, ClaimStatus finalStatus) {
+        processedClaims.add(claim.claimId);
+        claimFinalStatus.put(claim.claimId, finalStatus);
+        claimAttempts.put(claim.claimId, claim.attempt);
+    }
+
+    public ReentrantLock getPolicyLock(String policyNumber) {
+        return policyLocks.get(policyNumber);
+    }
+
+    public Deque<Claim> getPolicyQueue(String policyNumber) {
+        return policyQueues.get(policyNumber);
+    }
+
+    public boolean isIngesting() {
+        return ingesting;
+    }
+
+    public void recordHistory(String claimId, String event) {
+        claimHistory.computeIfAbsent(claimId, k -> new ArrayList<>()).add(event);
+    }
+
+    public Map<String, ClaimStatus> getClaimFinalStatus() {
+        return claimFinalStatus;
+    }
+
+    public Map<String, Integer> getClaimAttempts() {
+        return claimAttempts;
+    }
+
+    public Map<String, List<String>> getClaimHistory() {
+        return claimHistory;
+    }
+
+    public Set<String> getProcessedClaims() {
+        return processedClaims;
+    }
+
+    public BlockingQueue<Claim> getGlobalQueue() {
+        return globalQueue;
+    }
+
+    public ThrottleMonitor getThrottleMonitor() {
+        return throttleMonitor;
     }
 
     public void shutdown() {
-        isShuttingDown.set(true);
-        workers.shutdown();
-        try {
-            if (!workers.awaitTermination(60, TimeUnit.SECONDS)) {
-                workers.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            workers.shutdownNow();
-        }
-
-        report.generate(processedClaims.size());
-        System.out.println("Summary written to summary.txt");
+        ingesting = false;
+        workers.shutdownNow();
+        throttleMonitor.stop();
     }
 }
