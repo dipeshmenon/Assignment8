@@ -25,7 +25,7 @@ public class ThrottleMonitor implements Runnable {
         Instant now = Instant.now();
         suspiciousTimestamps.addLast(now);
 
-        // Print suspicious claim immediately
+
         System.out.printf("Suspicious claim detected: %s amount=%d type=%s%n",
                 claim.claimId, claim.amount, claim.type);
 
@@ -35,7 +35,7 @@ public class ThrottleMonitor implements Runnable {
             paused = true;
             new Thread(() -> {
                 try {
-                    System.out.println("Throttling intake for 2 seconds due to suspicious claims...");
+                    System.out.println("Throttling intake for 2 seconds due to suspicious claims.");
                     Thread.sleep(2000);
                 } catch (InterruptedException ignored) {}
                 synchronized (this) {

@@ -48,8 +48,6 @@ public class SummaryReport {
             totalAttempts += attempts.getOrDefault(claimId, 1);
         }
 
-        // Calculate total amount paid (approximate)
-        // Note: Need to track amounts per claim in production - simplified here
 
         try (PrintWriter pw = new PrintWriter(new FileWriter("summary.txt"))) {
             pw.printf("Total unique claims processed: %d%n", processedClaims.size());

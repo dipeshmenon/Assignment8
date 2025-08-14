@@ -29,33 +29,33 @@ public class ClaimWorker implements Runnable {
 
                 ReentrantLock lock = processor.getPolicyLock(claim.policyNumber);
                 if (lock == null) {
-                    // Should not happen
+
                     processor.enqueueClaim(claim);
                     continue;
                 }
 
                 boolean acquired = lock.tryLock(1, TimeUnit.SECONDS);
                 if (!acquired) {
-                    // Could not get lock, re-queue claim
+
                     processor.enqueueClaim(claim);
                     continue;
                 }
 
                 try {
-                    // Confirm claim is first in policy queue
+
                     Deque<Claim> queue = processor.getPolicyQueue(claim.policyNumber);
                     if (queue == null || queue.peekFirst() != claim) {
-                        // Not first, requeue
+
                         processor.enqueueClaim(claim);
                         continue;
                     }
 
-                    // Remove from per-policy queue head
+
                     queue.pollFirst();
 
-                    // Idempotency check
+
                     if (processor.getProcessedClaims().contains(claim.claimId)) {
-                        // Already processed
+
                         AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
                                 ClaimStatus.RECEIVED, ClaimStatus.RECEIVED, claim.attempt);
                         continue;
@@ -78,13 +78,13 @@ public class ClaimWorker implements Runnable {
                         if (claim.attempt <= Config.RETRY_LIMIT) {
                             AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
                                     ClaimStatus.PROCESSING, ClaimStatus.FAILED, claim.attempt);
-                            processor.enqueueClaim(claim); // retry preserving order
+                            processor.enqueueClaim(claim);
                         } else {
                             processor.markProcessed(claim, ClaimStatus.REJECTED);
                             AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
                                     ClaimStatus.PROCESSING, ClaimStatus.REJECTED, claim.attempt);
                         }
-                    } else { // PERMANENT_FAILURE
+                    } else {
                         processor.markProcessed(claim, ClaimStatus.REJECTED);
                         AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
                                 ClaimStatus.PROCESSING, ClaimStatus.REJECTED, claim.attempt);
@@ -107,7 +107,7 @@ public class ClaimWorker implements Runnable {
             var future = exec.submit(() -> ExternalCheckSimulator.check(claim));
             return future.get(Config.TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            // Timeout or other
+
             return ExternalCheckSimulator.Result.TRANSIENT_FAILURE;
         } finally {
             exec.shutdownNow();

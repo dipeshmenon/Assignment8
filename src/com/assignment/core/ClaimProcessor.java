@@ -44,7 +44,7 @@ public class ClaimProcessor {
     private long startTime;
 
     public ClaimProcessor() {
-        // Priority queue with comparator to prioritize URGENT over NORMAL, then timestamp
+
         this.globalQueue = new PriorityBlockingQueue<>(backlogCapacity, (c1, c2) -> {
             if (c1.priority != c2.priority)
                 return c1.priority == Priority.URGENT ? -1 : 1;
@@ -56,14 +56,14 @@ public class ClaimProcessor {
 
     public void start() throws IOException {
         startTime = System.nanoTime();
-        // Start throttle monitor
+
         new Thread(throttleMonitor).start();
 
-        // Start ingestion thread
+
         Thread ingestionThread = new Thread(this::ingestClaims);
         ingestionThread.start();
 
-        // Start workers
+
         for (int i = 0; i < workerCount; i++) {
             workers.submit(new ClaimWorker(this));
         }
@@ -77,7 +77,7 @@ public class ClaimProcessor {
             Thread.currentThread().interrupt();
         }
 
-        // Write summary report
+
         new SummaryReport(this).writeReport();
 
         long elapsed = System.nanoTime() - startTime;
@@ -86,7 +86,7 @@ public class ClaimProcessor {
 
     private void ingestClaims() {
         try (BufferedReader br = Files.newBufferedReader(Paths.get("/Users/DIPESH.M/Documents/Assignment8/src/com/assignment/main/Claims Data - Sheet2.csv"),java.nio.charset.StandardCharsets.UTF_8)) {
-            String line = br.readLine(); // Skip header
+            String line = br.readLine();
             while ((line = br.readLine()) != null) {
                 waitForBacklogSpace();
                 Claim claim = parseClaim(line);
@@ -95,7 +95,7 @@ public class ClaimProcessor {
                 if (!processedClaims.contains(claim.claimId)) {
                     enqueueClaim(claim);
                 } else {
-                    // Duplicate, ignore but log attempt
+
                     AuditLogger.log(claim.claimId, Thread.currentThread().getName(),
                             ClaimStatus.RECEIVED, ClaimStatus.RECEIVED, 0);
                 }
@@ -137,12 +137,12 @@ public class ClaimProcessor {
     }
 
     public void enqueueClaim(Claim claim) {
-        // Add to per-policy queue
+
         policyQueues.computeIfAbsent(claim.policyNumber, k -> new ConcurrentLinkedDeque<>()).addLast(claim);
-        // Add lock for policy if not present
+
         policyLocks.computeIfAbsent(claim.policyNumber, k -> new ReentrantLock());
 
-        // Add to global queue
+
         try {
             globalQueue.put(claim);
         } catch (InterruptedException e) {

@@ -10,7 +10,7 @@ public class ExternalCheckSimulator {
     }
 
     public static Result check(Claim claim) throws InterruptedException {
-        Thread.sleep(500 + random.nextInt(1000)); // Simulate slowness
+        Thread.sleep(500 + random.nextInt(1000));
         int roll = random.nextInt(100);
         if (roll < 70) return Result.SUCCESS;
         else if (roll < 90) return Result.TRANSIENT_FAILURE;
